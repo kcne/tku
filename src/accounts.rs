@@ -456,13 +456,17 @@ pub fn reconcile_live_creds() {
 /// first time we see them. Anchors the bootstrap switch entry to the
 /// earliest record timestamp so historical records get attributed correctly
 /// instead of all collapsing to "Utc::now()".
-pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<String> {
-    let (bytes, info) = read_live().ok().flatten()?;
-    let current_org = info.org_uuid?;
+pub fn bootstrap_if_needed_post_scan(
+    claude_records: &[&UsageRecord],
+    offline: bool,
+) -> Option<String> {
     let mut registry = load_registry(TOOL_CLAUDE);
     if !registry.accounts.is_empty() {
         return registry.latest_switch().map(|s| s.name.clone());
     }
+    let (bytes, info) = read_live().ok().flatten()?;
+    let (current_org, oauth_account) =
+        bootstrap_org(&info, offline, crate::subscription::fetch_account_identity)?;
 
     let earliest = claude_records
         .iter()
@@ -478,7 +482,7 @@ pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<
         last_used_at: now,
         subscription_type: info.subscription_type,
         rate_limit_tier: info.rate_limit_tier,
-        oauth_account: None,
+        oauth_account,
     });
     registry.switch_log.push(SwitchEntry {
         at: earliest,
@@ -495,6 +499,25 @@ pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<
         eprintln!("warning: failed to persist account registry: {e}");
     }
     Some("default".to_string())
+}
+
+/// The org UUID (and, when it came from the profile API, the `oauthAccount`
+/// blob) to register the live login under. Current Claude Code logins carry
+/// no `organizationUuid`, so fall back to the profile API like `add()` does,
+/// unless we're offline.
+fn bootstrap_org(
+    info: &CredsInfo,
+    offline: bool,
+    lookup: impl FnOnce(&str) -> Result<crate::subscription::AccountIdentity>,
+) -> Option<(String, Option<serde_json::Value>)> {
+    if let Some(org) = &info.org_uuid {
+        return Some((org.clone(), None));
+    }
+    if offline {
+        return None;
+    }
+    let identity = lookup(info.access_token.as_deref()?).ok()?;
+    Some((identity.org_uuid, Some(identity.oauth_account)))
 }
 
 fn short_org(org: &str) -> String {
@@ -1107,4 +1130,70 @@ pub fn remove(name: &str, force: bool) -> Result<()> {
 
 fn format_plan(sub_type: Option<&str>, rate_tier: Option<&str>) -> String {
     crate::subscription::format_plan_label(sub_type, rate_tier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscription::AccountIdentity;
+
+    fn info(org_uuid: Option<&str>, access_token: Option<&str>) -> CredsInfo {
+        CredsInfo {
+            org_uuid: org_uuid.map(String::from),
+            access_token: access_token.map(String::from),
+            subscription_type: None,
+            rate_limit_tier: None,
+        }
+    }
+
+    fn identity(org_uuid: &str) -> AccountIdentity {
+        AccountIdentity {
+            org_uuid: org_uuid.to_string(),
+            oauth_account: serde_json::json!({ "organizationUuid": org_uuid }),
+        }
+    }
+
+    #[test]
+    fn bootstrap_org_comes_from_the_credentials_when_present() {
+        let got = bootstrap_org(&info(Some("org-creds"), Some("tok")), false, |_| {
+            panic!("profile API must not be called")
+        });
+        assert_eq!(got, Some(("org-creds".to_string(), None)));
+    }
+
+    #[test]
+    fn bootstrap_org_falls_back_to_the_profile_api() {
+        // Current Claude Code logins carry no organizationUuid.
+        let got = bootstrap_org(&info(None, Some("tok")), false, |token| {
+            assert_eq!(token, "tok");
+            Ok(identity("org-profile"))
+        });
+        let (org, oauth_account) = got.unwrap();
+        assert_eq!(org, "org-profile");
+        assert_eq!(oauth_account.unwrap()["organizationUuid"], "org-profile");
+    }
+
+    #[test]
+    fn bootstrap_org_stays_offline_when_asked() {
+        let got = bootstrap_org(&info(None, Some("tok")), true, |_| {
+            panic!("profile API must not be called offline")
+        });
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn bootstrap_org_is_none_when_the_profile_api_fails() {
+        let got = bootstrap_org(&info(None, Some("tok")), false, |_| {
+            Err(anyhow!("network down"))
+        });
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn bootstrap_org_is_none_without_an_access_token() {
+        let got = bootstrap_org(&info(None, None), false, |_| {
+            panic!("profile API needs a token")
+        });
+        assert_eq!(got, None);
+    }
 }
